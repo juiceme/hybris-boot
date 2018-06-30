@@ -1,0 +1,205 @@
+#!/bin/sh
+#
+# Factory reset tool for LVM based Sailfish OS filesystems.
+#
+# Copyright (C) 2015 Jolla Ltd.
+# Contact: Kalle Jokiniemi <kalle.jokiniemi@jolla.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; version 2
+# of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+# Parameters:
+# $1 -> Root size in MB
+# $2 -> Reserve space for later use in MB
+
+ROOTDEV="/dev/sailfish/root"
+HOMEDEV="/dev/sailfish/home"
+ROOTIMG="root.img"
+HOMEIMG="home.img"
+NAME=$0
+
+PHYSDEV_PART_LABEL="sailfish"
+FIMAGE_PART_LABEL="fimage"
+# From https://github.com/mer-hybris/hybris-initrd
+. /etc/sysconfig/partitions
+
+flash_script()
+{
+cat << 'EOF'
+#!/bin/sh
+for SCRIPT in /var/lib/platform-updates/* ; do
+	if [ -x $SCRIPT ]; then
+		echo "$SCRIPT ... "
+		$SCRIPT && echo "OK" || echo "FAILED"
+	fi
+done
+EOF
+}
+
+flash_firmwares()
+{
+	if test -z $1; then
+		echo "$NAME: No mount point given" > /dev/kmsg
+		exit 1
+	fi
+	mount -t tmpfs tmpfs $1/tmp
+	mount -t devtmpfs devtmpfs $1/dev
+	mount -t proc proc $1/proc
+	flash_script > $1/tmp/flash-firmwares
+	chmod 755 $1/tmp/flash-firmwares
+	chroot $1 /tmp/flash-firmwares
+	umount $1/tmp $1/dev $1/proc
+}
+
+if test -z $1 || ! test $1 -ge 0; then
+	echo "$NAME: Please pass root size in MB as parameter!" > /dev/kmsg
+	exit 1
+fi
+
+if test -z $2 || ! test $2 -ge 0; then
+	echo "$NAME: Please pass reserve size in MB as parameter!" > /dev/kmsg
+	exit 1
+fi
+
+ROOT_SIZE=$1
+RESERVE_KB=$(expr $2 \* 1024)
+
+echo "$NAME: Starting factory reset.." > /dev/kmsg
+
+PHYSDEV=$(find-mmc-bypartlabel "$PHYSDEV_PART_LABEL")
+if test $? != "0"; then
+	echo "$NAME: Error: could not find sailfish partition" > /dev/kmsg
+	exit 1
+fi
+
+FIMAGE_DEV_PATH=$(find-mmc-bypartlabel "$FIMAGE_PART_LABEL")
+if test $? != "0"; then
+	echo "$NAME: Error: could not find fimage partition" > /dev/kmsg
+	exit 1
+fi
+
+echo "$NAME: fimage partition in $FIMAGE_DEV_PATH" > /dev/kmsg
+
+FIMAGE_MOUNT=$(mktemp -d)
+if ! mount "$FIMAGE_DEV_PATH" "$FIMAGE_MOUNT"; then
+	echo "$NAME: Error, could not mount fimage for factory reset!" > /dev/kmsg
+	rmdir $FIMAGE_MOUNT
+	exit 1
+fi
+
+# Find the biggest versioned Sailfish folder and use that
+SAILFISH_FIMAGE=$(ls -d $FIMAGE_MOUNT/Sailfish* | tail -1)
+WORKDIR=$(pwd)
+
+if test -z $SAILFISH_FIMAGE; then
+	echo "$NAME: Error: Could not find a recovery image folder!" > /dev/kmsg
+	exit 1
+fi
+
+# Check that the factory images are ok to use and detect compression method.
+cd $SAILFISH_FIMAGE
+if test -f $ROOTIMG.lzo && test -f $HOMEIMG.lzo; then
+	ROOTIMG="$ROOTIMG.lzo"
+	HOMEIMG="$HOMEIMG.lzo"
+	DECOMPRESS_CMD="lzopcat"
+elif test -f $ROOTIMG.gz && test -f $HOMEIMG.gz; then
+	ROOTIMG="$ROOTIMG.gz"
+	HOMEIMG="$HOMEIMG.gz"
+	DECOMPRESS_CMD="pigz -d -c"
+elif test -f $ROOTIMG.bz2 && test -f $HOMEIMG.bz2; then
+	ROOTIMG="$ROOTIMG.bz2"
+	HOMEIMG="$HOMEIMG.bz2"
+	DECOMPRESS_CMD="bzip2 -d -c"
+elif test -f $ROOTIMG.xz && test -f $HOMEIMG.xz; then
+	ROOTIMG="$ROOTIMG.xz"
+	HOMEIMG="$HOMEIMG.xz"
+	DECOMPRESS_CMD="xz -d -c"
+else
+	echo "$NAME: Error: cannot find sailfish recovery image!" > /dev/kmsg
+	exit 1
+fi
+
+if ! md5sum -c $ROOTIMG.md5 > /dev/kmsg; then
+	echo "$NAME: Error: root recovery image corrupted!" > /dev/kmsg
+	exit 1
+fi
+
+if ! md5sum -c $HOMEIMG.md5 > /dev/kmsg; then
+	echo "$NAME: Error: home recovery image corrupted!" > /dev/kmsg
+	exit 1
+fi
+
+cd $WORKDIR
+
+# Clean up old LVM if it happens to exist
+lvm vgchange -a n
+lvm vgremove -y sailfish
+lvm pvremove -y $PHYSDEV
+
+if test "$SAILFISHOS_WIPE_PARTITIONS" = "1"; then
+	dd if=/dev/zero of=$PHYSDEV bs=1M
+fi
+
+# Create the LVM setup
+if ! lvm pvcreate $PHYSDEV; then
+	echo "$NAME: Error, could create LVM physical device for $PHYSDEV" > /dev/kmsg
+	exit 1
+fi
+
+# If the PV exists, creating VG should never fail
+lvm vgcreate sailfish $PHYSDEV
+
+# Checking for errors to maybe catch wrong root size parameter
+if ! lvm lvcreate -L "$ROOT_SIZE"M --name root sailfish; then
+	echo "$NAME: Error, could create root LV" > /dev/kmsg
+	exit 1
+fi
+
+
+# Calculate home size
+FREE_EXTENTS=$(lvm vgdisplay sailfish -c | cut -d ":" -f 16)
+EXTENT_SIZE=$(lvm vgdisplay sailfish -c | cut -d ":" -f 13)
+FREE_KB=$(expr $FREE_EXTENTS \* $EXTENT_SIZE)
+HOME_SIZE=$(expr $FREE_KB - $RESERVE_KB)
+
+# Check for too big reserve (not enough room left for home) case (1024kB * 64 = 64MB)
+if test $HOME_SIZE -le 65536; then
+	echo "$NAME: Error: too big reserve, not enough space for home" > /dev/kmsg
+	exit 1
+fi
+
+# Create home LV
+lvm lvcreate -L "$HOME_SIZE"K --name home sailfish
+
+# Start restoring Sailfish OS from the factory images
+$DECOMPRESS_CMD $SAILFISH_FIMAGE/$ROOTIMG > $ROOTDEV
+$DECOMPRESS_CMD $SAILFISH_FIMAGE/$HOMEIMG > $HOMEDEV
+sync
+
+resize2fs -f $ROOTDEV
+resize2fs -f $HOMEDEV
+
+sync
+
+# Flash firmwares from the resetted root
+TEMPMOUNT=$(mktemp -d)
+mount $ROOTDEV $TEMPMOUNT
+flash_firmwares $TEMPMOUNT
+
+# Clean up
+umount $TEMPMOUNT
+rmdir $TEMPMOUNT
+
+umount $FIMAGE_MOUNT
+rmdir $FIMAGE_MOUNT

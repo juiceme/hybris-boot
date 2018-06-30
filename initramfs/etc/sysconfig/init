@@ -1,0 +1,7 @@
+# Common settings for normal and recovery init.
+
+# Amount of space to keep unallocated for refilling root or home later on.
+LVM_RESERVED_MB=0
+
+# Default size for root LV
+LVM_ROOT_SIZE=2500

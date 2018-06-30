@@ -1,0 +1,5 @@
+# Path to file to read current battery charge from.
+BATTERY_CAPACITY_FILE="/sys/class/power_supply/*_battery/capacity"
+
+# Battery charged capacity threshold before allowing to start a factory reset
+BATTERY_CAPACITY_THRESHOLD=0
